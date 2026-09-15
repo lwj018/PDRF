@@ -1,0 +1,17 @@
+torch>=2.0
+torchvision
+accelerate
+diffusers
+timm
+einops
+numpy
+scipy
+h5py
+pandas
+opencv-python-headless
+matplotlib
+pywt
+moviepy
+lpips
+PyYAML
+wandb
