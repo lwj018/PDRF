@@ -9,28 +9,30 @@ physics-guided velocity regularizer L_phy.
 
 import numpy as np
 import torch
+import scipy.ndimage as ndimage
 from scipy.ndimage import map_coordinates
 import cv2
 
 
 class SemiLagrangianPrior:
     """
-    半拉格朗日外推（改良版）
-    - 假设 upstream 已将所有帧统一归一化到 [0,1]
-    - Farneback 光流使用固定刻度，不做逐帧 min-max
-    - 无指数衰减；插值=三次样条；边界=nearest
-    - 支持按步数刷新流场，提升长时效稳定性
+    Semi-Lagrangian extrapolation (improved version)
+    - Assumes upstream has already normalized all frames to [0, 1]
+    - Farneback optical flow uses a fixed scale, no per-frame min-max
+    - No exponential decay; interpolation = cubic spline; border = nearest
+    - Supports refreshing the flow field every N steps for better
+      long-horizon stability
     """
 
     def __init__(
         self,
         motion_estimation_method: str = "farneback",   # 'farneback' | 'gradient'
-        extrapolation_timestep: int = 5,               # 分钟（占位，若要物理量换算可用）
+        extrapolation_timestep: int = 5,               # minutes (placeholder; use if physical conversion is needed)
         border_treatment: str = "nearest",             # 'nearest' | 'reflect' | 'zeros'
         interp_order: int = 3,                         # 3: cubic, 1: bilinear
-        smooth_flow_sigma: float = 1.2,                # 光流高斯平滑 sigma；<=0 关闭
-        clip_flow_ratio: float = 0.10,                 # 位移限幅= min(H,W)*ratio
-        refresh_flow_every: int | None = None          # 每多少步重估一次流场；None/0 关闭
+        smooth_flow_sigma: float = 1.2,                # Gaussian smoothing sigma for optical flow; <=0 disables
+        clip_flow_ratio: float = 0.10,                 # displacement clip = min(H, W) * ratio
+        refresh_flow_every: int | None = None          # re-estimate flow every N steps; None/0 disables
     ):
         self.motion_method = motion_estimation_method
         self.timestep = extrapolation_timestep
@@ -42,27 +44,27 @@ class SemiLagrangianPrior:
             int(refresh_flow_every) if refresh_flow_every and refresh_flow_every > 0 else None
         )
 
-    # ------------------------ 光流估计 ------------------------
+    # ------------------------ Optical flow estimation ------------------------
 
     @staticmethod
     def _unit_to_u8(frame01: np.ndarray) -> np.ndarray:
-        """已在 [0,1] 的帧 → uint8 固定刻度（避免逐帧 min-max）"""
+        """Frame already in [0, 1] -> uint8 with a fixed scale (avoids per-frame min-max)"""
         f = np.clip(frame01, 0.0, 1.0)
         return (f * 255.0).astype(np.uint8)
 
     def estimate_motion_farneback(self, frames: np.ndarray) -> np.ndarray:
         """
-        用最后两帧估计稠密光流（像素/步）
-        frames: [T,H,W]，值域已是 [0,1]
-        return: [2,H,W]，(u,v)，右/下为正
+        Estimate dense optical flow (pixels/step) from the last two frames.
+        frames: [T, H, W], values already in [0, 1]
+        return: [2, H, W], (u, v), positive = right/down
         """
         if len(frames) < 2:
-            raise ValueError("至少需要2帧来估计运动")
+            raise ValueError("At least 2 frames are required to estimate motion")
 
         f1 = self._unit_to_u8(frames[-2].astype(np.float32))
         f2 = self._unit_to_u8(frames[-1].astype(np.float32))
 
-        # Farneback 参数可按需微调
+        # Farneback parameters can be tuned as needed
         flow = cv2.calcOpticalFlowFarneback(
             f1, f2,
             None,            # init flow
@@ -73,11 +75,11 @@ class SemiLagrangianPrior:
             5,               # poly_n
             1.2,             # poly_sigma
             0                # flags
-        )  # (H,W,2)
+        )  # (H, W, 2)
 
         u, v = flow[..., 0], flow[..., 1]
 
-        # 平滑 + 限幅
+        # Smooth + clip
         if self.smooth_flow_sigma and self.smooth_flow_sigma > 0:
             u = cv2.GaussianBlur(u, (0, 0), self.smooth_flow_sigma)
             v = cv2.GaussianBlur(v, (0, 0), self.smooth_flow_sigma)
@@ -91,7 +93,7 @@ class SemiLagrangianPrior:
 
     @staticmethod
     def _estimate_motion_gradient(frame1: np.ndarray, frame2: np.ndarray) -> np.ndarray:
-        """简化梯度法（备用）"""
+        """Simplified gradient-based method (fallback)"""
         dt = frame2 - frame1
         dx = ndimage.sobel(frame1, axis=1)
         dy = ndimage.sobel(frame1, axis=0)
@@ -112,45 +114,45 @@ class SemiLagrangianPrior:
         v = np.clip(v, -max_motion, max_motion)
         return np.array([u, v])
 
-    # ------------------------ 外推主流程 ------------------------
+    # ------------------------ Extrapolation main pipeline ------------------------
 
     def extrapolate_frames(self, input_frames: np.ndarray, n_future_frames: int) -> np.ndarray:
         """
-        半拉格朗日外推
-        input_frames: [T,H,W] 或 [T,C,H,W]，值域已是 [0,1]
-        return: [K,H,W] 或 [K,C,H,W]，同值域
+        Semi-Lagrangian extrapolation.
+        input_frames: [T, H, W] or [T, C, H, W], values already in [0, 1]
+        return:       [K, H, W] or [K, C, H, W], same value range
         """
         shape = input_frames.shape
-        if len(shape) == 4:  # [T,C,H,W]
+        if len(shape) == 4:  # [T, C, H, W]
             T, C, H, W = shape
             outs = []
             for c in range(C):
                 outs.append(self._extrapolate_single_channel(input_frames[:, c, :, :], n_future_frames))
-            return np.stack(outs, axis=1)  # [K,C,H,W]
-        elif len(shape) == 3:  # [T,H,W]
+            return np.stack(outs, axis=1)  # [K, C, H, W]
+        elif len(shape) == 3:  # [T, H, W]
             return self._extrapolate_single_channel(input_frames, n_future_frames)
         else:
-            raise ValueError(f"不支持的输入形状: {shape}")
+            raise ValueError(f"Unsupported input shape: {shape}")
 
     def _extrapolate_single_channel(self, frames: np.ndarray, K: int) -> np.ndarray:
         """
-        单通道外推
-        frames: [T,H,W] in [0,1]
-        return: [K,H,W]
+        Single-channel extrapolation.
+        frames: [T, H, W] in [0, 1]
+        return: [K, H, W]
         """
         T, H, W = frames.shape
 
-        # 初始光流
+        # Initial optical flow
         if self.motion_method == "farneback":
             uv = self.estimate_motion_farneback(frames)
         else:
             uv = self._estimate_motion_gradient(frames[-2], frames[-1])
         u, v = uv[0], uv[1]
 
-        # 坐标网格
+        # Coordinate grid
         yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
 
-        # 边界模式
+        # Border mode
         if self.border_treatment == "nearest":
             mode = "nearest"; cval = 0.0
         elif self.border_treatment == "reflect":
@@ -160,29 +162,29 @@ class SemiLagrangianPrior:
         else:
             mode = "nearest"; cval = 0.0
 
-        # 累积生成
+        # Accumulate generated frames
         out = []
-        last_frame = frames[-1].astype(np.float32)  # 作为 t=0 的源
+        last_frame = frames[-1].astype(np.float32)  # source at t = 0
         prev_frame_for_refresh = frames[-2].astype(np.float32)
 
         for t in range(1, K + 1):
-            # 反向追踪
+            # Backward tracing
             x_src = xx - t * u
             y_src = yy - t * v
             x_src = np.clip(x_src, 0, W - 1)
             y_src = np.clip(y_src, 0, H - 1)
 
             coords = np.array([y_src, x_src])
-            # 三次样条 + 合理边界，保护强回波峰值
+            # Cubic spline + sensible border to protect strong echo peaks
             ft = map_coordinates(
                 last_frame, coords, order=self.interp_order,
                 mode=mode, cval=cval, prefilter=False
             )
             out.append(ft)
 
-            # 流场刷新（可选）：每 m 步用最近两帧基线重估 uv
+            # Flow refresh (optional): re-estimate uv from the two most recent baseline frames every m steps
             if self.refresh_flow_every and (t % self.refresh_flow_every == 0) and (t < K):
-                # 用“上一基线帧”和“当前基线帧”重估
+                # Re-estimate from the "previous baseline frame" and the "current baseline frame"
                 prev = last_frame
                 curr = ft
                 if self.motion_method == "farneback":
@@ -191,17 +193,17 @@ class SemiLagrangianPrior:
                     uv = self._estimate_motion_gradient(prev, curr)
                 u, v = uv[0], uv[1]
                 prev_frame_for_refresh = prev
-                last_frame = curr  # 更新“最近真实/基线帧”
-            # 若不刷新，也保持 last_frame 不变（始终追踪自初始 last）
+                last_frame = curr  # update "most recent real/baseline frame"
+            # If not refreshed, last_frame stays unchanged (always traced back to the initial last frame)
 
         return np.stack(out, axis=0).astype(np.float32)
 
-    # ------------------------ Torch 包装 ------------------------
+    # ------------------------ Torch wrapper ------------------------
 
     def extrapolate_tensor(self, input_tensor: torch.Tensor, n_future_frames: int) -> torch.Tensor:
         """
-        input_tensor: [B,T,H,W] 或 [B,T,C,H,W]，值域 [0,1]
-        return:       [B,K,H,W] 或 [B,K,C,H,W]，同值域
+        input_tensor: [B, T, H, W] or [B, T, C, H, W], values in [0, 1]
+        return:       [B, K, H, W] or [B, K, C, H, W], same value range
         """
         device = input_tensor.device
         shape = input_tensor.shape
@@ -209,23 +211,23 @@ class SemiLagrangianPrior:
 
         outs = []
         for b in range(x_np.shape[0]):
-            if len(shape) == 5:   # [B,T,C,H,W]
-                fr = x_np[b]      # [T,C,H,W]
-            elif len(shape) == 4: # [B,T,H,W]
-                fr = x_np[b]      # [T,H,W]
+            if len(shape) == 5:   # [B, T, C, H, W]
+                fr = x_np[b]      # [T, C, H, W]
+            elif len(shape) == 4: # [B, T, H, W]
+                fr = x_np[b]      # [T, H, W]
             else:
-                raise ValueError(f"不支持的输入形状: {shape}")
+                raise ValueError(f"Unsupported input shape: {shape}")
 
             try:
-                yb = self.extrapolate_frames(fr, n_future_frames)  # [K,H,W] 或 [K,C,H,W]
+                yb = self.extrapolate_frames(fr, n_future_frames)  # [K, H, W] or [K, C, H, W]
             except Exception as e:
-                print(f"[SemiLagrangian] Batch {b} 外推失败: {e}")
-                # 失败回退：用最后一帧复制
+                print(f"[SemiLagrangian] Batch {b} extrapolation failed: {e}")
+                # Fallback on failure: repeat the last frame
                 if len(shape) == 5:
-                    last = fr[-1]                                 # [C,H,W]
+                    last = fr[-1]                                 # [C, H, W]
                     yb = np.tile(last[None], (n_future_frames, 1, 1, 1))
                 else:
-                    last = fr[-1]                                 # [H,W]
+                    last = fr[-1]                                 # [H, W]
                     yb = np.tile(last[None], (n_future_frames, 1, 1))
             outs.append(yb)
 
@@ -233,19 +235,18 @@ class SemiLagrangianPrior:
         y = torch.from_numpy(y_np).float().to(device)
         return y
 
-
     @torch.no_grad()
     def get_extrapolated_condition(self, frames_in: torch.Tensor, frames_out_len: int) -> torch.Tensor:
         """
-        frames_in:  [B,T_in,H,W] 或 [B,T_in,C,H,W]，值域 [0,1]
-        return:     [B,K,H,W]    或 [B,K,C,H,W]，值域 [0,1]
+        frames_in: [B, T_in, H, W] or [B, T_in, C, H, W], values in [0, 1]
+        return:    [B, K, H, W]    or [B, K, C, H, W], values in [0, 1]
         """
         return self.extrapolate_tensor(frames_in, frames_out_len)
 
     @torch.no_grad()
     def prepare_training_data(self, frames_in: torch.Tensor, frames_out: torch.Tensor):
         """
-        返回 (Y_base, frames_out)
+        Returns (Y_base, frames_out)
         """
         y_base = self.get_extrapolated_condition(frames_in, frames_out.shape[1])
         return y_base, frames_out
@@ -253,14 +254,14 @@ class SemiLagrangianPrior:
     @staticmethod
     def build_condition(frames_in: torch.Tensor, y_base: torch.Tensor) -> torch.Tensor:
         """
-        把 Y_base 并入 condition：cond = concat(ctx, Y_base)（沿时间维）
-        - frames_in: [B,T_in,H,W] 或 [B,T_in,C,H,W]
-        - y_base:    [B,K,H,W]    或 [B,K,C,H,W]
-        return:      [B,T_in+K,H,W] 或 [B,T_in+K,C,H,W]
+        Merge Y_base into the condition: cond = concat(ctx, Y_base) (along the time dim)
+        - frames_in: [B, T_in, H, W] or [B, T_in, C, H, W]
+        - y_base:    [B, K, H, W]    or [B, K, C, H, W]
+        return:      [B, T_in+K, H, W] or [B, T_in+K, C, H, W]
         """
         assert frames_in.dim() in (4, 5), f"frames_in shape={frames_in.shape}"
         assert y_base.dim() in (4, 5), f"y_base shape={y_base.shape}"
-        # 统一通道维
+        # Unify channel dim
         if frames_in.dim() == 4:
             fi = frames_in
             yb = y_base
